@@ -723,10 +723,18 @@ const DB={
     const i=all.findIndex(x=>x.id===item.id);
     if(i>=0)all[i]=item;else all.push(item);
     S.s(table,all);
-    // Sync to cloud (skip maps to avoid Firestore 1MB doc limit)
-    if(Cloud.available()&&table!=='maps'){
+    // Sync to cloud — maps included but strip imgData if too large
+    if(Cloud.available()){
       const cloudItem={...item};
-      delete cloudItem.imgData; // strip large image data
+      // For maps, check size — Firestore limit is ~1MB per doc
+      if(table==='maps'&&cloudItem.imgData&&cloudItem.imgData.length>800000){
+        // Image too large — store map metadata without image
+        delete cloudItem.imgData;
+        cloudItem.imgTooLarge=true;
+      } else {
+        // For all other items, strip imgData (token images stored locally)
+        if(table!=='maps')delete cloudItem.imgData;
+      }
       Cloud.saveItem(table,cloudItem);
     }
     return item;
@@ -3635,13 +3643,13 @@ const RT={
 
   sendFullState(){
     const tokens=Canvas.getTokens().map(t=>{const c={...t};delete c.imgEl;return c;});
-    // Include the active map image so players can render it
-    let mapData=null;
+    // Send map ID only — player fetches image from Firestore/local cache
+    let mapId=null;
     if(CC){
       const maps=DB.list('maps',CC.id);
-      if(maps[activeMapIdx]&&maps[activeMapIdx].imgData)mapData=maps[activeMapIdx].imgData;
+      if(maps[activeMapIdx])mapId=maps[activeMapIdx].id;
     }
-    this.pub('full_state',{tokens,drawData:Canvas.exportDraw(),fogData:Canvas.exportFog(),activeMapIdx,mapData});
+    this.pub('full_state',{tokens,drawData:Canvas.exportDraw(),fogData:Canvas.exportFog(),activeMapIdx,mapId});
   },
 
   flushIfDirty(){
@@ -3655,10 +3663,25 @@ const RT={
 function applyRemoteMapSwitch(idx,mapId){
   activeMapIdx=idx;
   document.querySelectorAll('.map-tab').forEach((t,i)=>t.classList.toggle('on',i===idx));
-  const maps=CC?DB.list('maps',CC.id):[];
-  const map=maps[idx]||(mapId&&maps.find(m=>m.id===mapId));
-  if(map&&map.imgData)Canvas.loadMapDirect(map.imgData);
-  else Canvas.loadMapDirect(null);
+  // Load map from local cache (populated from Firestore when player joined)
+  if(CC){
+    const maps=DB.list('maps',CC.id);
+    const map=maps[idx]||(mapId&&maps.find(m=>m.id===mapId));
+    if(map&&map.imgData){Canvas.loadMapDirect(map.imgData);return;}
+    // If not in local cache, try fetching from Firestore by mapId
+    if(mapId&&fbDb){
+      fbDb.collection('maps').doc(mapId).get().then(doc=>{
+        if(doc.exists){
+          const m=doc.data();
+          if(m.imgData){
+            // Cache it locally
+            DB.save('maps',m);
+            Canvas.loadMapDirect(m.imgData);
+          }
+        }
+      }).catch(()=>{});
+    }
+  }
 }
 function applyRemoteInitiative(idx){
   const rows=document.querySelectorAll('#init-list .irow');
@@ -4056,30 +4079,43 @@ const Canvas=(()=>{
       }
     };
 
+    // Load map from local cache or Firestore using mapId
+    const loadMap=(onDone)=>{
+      if(typeof CC!=='undefined'&&CC){
+        const maps=DB.list('maps',CC.id);
+        const m=maps[d.activeMapIdx]||(d.mapId&&maps.find(x=>x.id===d.mapId));
+        if(m&&m.imgData){
+          const mi=new Image();
+          mi.onload=()=>{mapImg=mi;redrawBg();onDone();};
+          mi.src=m.imgData;
+          return;
+        }
+        // Try Firestore if not in local cache
+        if(d.mapId&&typeof fbDb!=='undefined'&&fbDb){
+          fbDb.collection('maps').doc(d.mapId).get().then(doc=>{
+            if(doc.exists){
+              const m2=doc.data();
+              if(m2.imgData){
+                DB.save('maps',m2); // cache locally
+                const mi=new Image();
+                mi.onload=()=>{mapImg=mi;redrawBg();onDone();};
+                mi.src=m2.imgData;
+                return;
+              }
+            }
+            onDone();
+          }).catch(()=>onDone());
+          return;
+        }
+      }
+      onDone();
+    };
+
     if(d.activeMapIdx!==undefined){
       activeMapIdx=d.activeMapIdx;
       document.querySelectorAll('.map-tab').forEach((t,i)=>t.classList.toggle('on',i===activeMapIdx));
     }
-
-    // Use map image from state payload (sent by GM) — works cross-device
-    if(d.mapData){
-      const mi=new Image();
-      mi.onload=()=>{mapImg=mi;redrawBg();doFinish();};
-      mi.src=d.mapData;
-      return;
-    }
-    // Fallback: try local maps library
-    if(typeof CC!=='undefined'&&CC){
-      const maps=DB.list('maps',CC.id);
-      const m=maps[activeMapIdx];
-      if(m&&m.imgData){
-        const mi=new Image();
-        mi.onload=()=>{mapImg=mi;redrawBg();doFinish();};
-        mi.src=m.imgData;
-        return;
-      }
-    }
-    doFinish();
+    loadMap(doFinish);
   }
 
   function getSelectedId(){return selectedTok?selectedTok.id:null;}
