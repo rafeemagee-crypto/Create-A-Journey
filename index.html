@@ -701,6 +701,8 @@ const DB={
   saveCampaign(c){
     const all=S.g('campaigns')||[];
     const i=all.findIndex(x=>x.id===c.id);
+    // Always stamp ownerName if we know the current user and they own this campaign
+    if(CU&&c.ownerId===CU.id&&!c.ownerName)c.ownerName=CU.name;
     if(i>=0)all[i]=c;else all.push(c);
     S.s('campaigns',all);
     // Sync to cloud — include flat memberIds for reliable array-contains queries
@@ -723,39 +725,34 @@ const DB={
     const i=all.findIndex(x=>x.id===item.id);
     if(i>=0)all[i]=item;else all.push(item);
     S.s(table,all);
-    // Sync to cloud — maps included but strip imgData if too large
     if(Cloud.available()){
       const cloudItem={...item};
-      // For maps, check size — Firestore limit is ~1MB per doc
       if(table==='maps'&&cloudItem.imgData&&cloudItem.imgData.length>800000){
-        // Image too large — store map metadata without image
-        delete cloudItem.imgData;
-        cloudItem.imgTooLarge=true;
+        delete cloudItem.imgData;cloudItem.imgTooLarge=true;
       } else {
-        // For all other items, strip imgData (token images stored locally)
         if(table!=='maps')delete cloudItem.imgData;
       }
       Cloud.saveItem(table,cloudItem);
     }
+    // Broadcast to session members so their view updates live
+    if(table!=='sessions'&&table!=='maps')RT.pub('data_refresh',{table,campaignId:item.campaignId});
     return item;
   },
   del(table,id){
-    // Remove from localStorage
+    const item=(S.g(table)||[]).find(x=>x.id===id);
+    const campaignId=item?item.campaignId:null;
     S.s(table,(S.g(table)||[]).filter(x=>x.id!==id));
-    // Track deleted IDs so syncFromCloud doesn't restore them
     const deleted=S.g('_deleted')||{};
     if(!deleted[table])deleted[table]=[];
     if(!deleted[table].includes(id))deleted[table].push(id);
     S.s('_deleted',deleted);
-    // Delete from Firestore — retry if Firebase not ready yet
     const tryDelete=()=>{
-      if(Cloud.available()){
-        Cloud.delItem(table,id);
-      } else {
-        setTimeout(tryDelete,500);
-      }
+      if(Cloud.available()){Cloud.delItem(table,id);}
+      else{setTimeout(tryDelete,500);}
     };
     tryDelete();
+    // Broadcast deletion to session members
+    if(table!=='sessions')RT.pub('data_refresh',{table,campaignId,deletedId:id});
   },
   activeSession(campaignId){return(S.g('sessions')||[]).find(s=>s.campaignId===campaignId&&s.active)||null;},
   sessionByCode(code){return(S.g('sessions')||[]).find(s=>s.code===code.toUpperCase()&&s.active)||null;}
@@ -1241,7 +1238,7 @@ async function joinCampaignByCode(){
 // ══════════════════════════════════════════
 function renderMembers(){
   const members=CC.members||[];
-  const owner=DB.accounts().find(a=>a.id===CC.ownerId)||{name:CC.ownerName||'Game Master',role:'gm'};
+  const owner=DB.accounts().find(a=>a.id===CC.ownerId)||{name:CC.ownerName||CC.ownerEmail||'Campaign Owner',role:'gm'};
   const isOwner=CC.ownerId===CU.id;
   const isMember=!isOwner&&members.some(m=>m.id===CU.id);
   document.getElementById('main').innerHTML=`
@@ -3623,6 +3620,43 @@ const RT={
         break;
       case'ready_response':
         handleReadyResponse(data);
+        break;
+      case'data_refresh':
+        // GM changed campaign data — members reload from Firestore and refresh view
+        if(!canEdit()&&data.table&&data.campaignId===CC?.id){
+          if(data.deletedId){
+            // Apply deletion locally immediately
+            const existing=S.g(data.table)||[];
+            S.s(data.table,existing.filter(x=>x.id!==data.deletedId));
+            const deleted=S.g('_deleted')||{};
+            if(!deleted[data.table])deleted[data.table]=[];
+            if(!deleted[data.table].includes(data.deletedId))deleted[data.table].push(data.deletedId);
+            S.s('_deleted',deleted);
+          }
+          // Reload from Firestore
+          if(Cloud.available()){
+            fbDb.collection(data.table).where('campaignId','==',data.campaignId).get().then(snap=>{
+              if(snap.empty)return;
+              const del=S.g('_deleted')||{};
+              const deletedIds=(del[data.table]||[]);
+              const local=S.g(data.table)||[];
+              snap.docs.forEach(d=>{
+                const item=d.data();
+                if(deletedIds.includes(item.id))return;
+                const i=local.findIndex(x=>x.id===item.id);
+                if(i>=0)local[i]=item;else local.push(item);
+              });
+              S.s(data.table,local);
+              // Refresh current panel if relevant
+              const active=document.querySelector('.snav.on');
+              if(active&&active.id){
+                const key=active.id.replace('n-','');
+                const tableToPanel={characters:'characters',quests:'quests',notes:'notes',npcs:'npcs',recaps:'recaps',wiki:'wiki',relations:'relations',abilities:'characters'};
+                if(tableToPanel[data.table]===key)go(key);
+              }
+            }).catch(()=>{});
+          }
+        }
         break;
     }
   },
