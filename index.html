@@ -652,15 +652,26 @@ const Cloud={
   async loadCampaignData(campaignId){
     if(!fbDb||!campaignId)return;
     const tables=['characters','quests','notes','npcs','maps','recaps','wiki','abilities','relations'];
+    const deleted=S.g('_deleted')||{};
     try{
       await Promise.all(tables.map(async table=>{
         const snap=await fbDb.collection(table).where('campaignId','==',campaignId).get();
         if(snap.empty)return;
+        const deletedIds=(deleted[table]||[]);
         const existing=S.g(table)||[];
         snap.docs.forEach(d=>{
           const item=d.data();
-          if(!existing.find(x=>x.id===item.id))existing.push(item);
-          else{const i=existing.findIndex(x=>x.id===item.id);existing[i]=item;}
+          // Skip items that were deleted locally
+          if(deletedIds.includes(item.id))return;
+          const i=existing.findIndex(x=>x.id===item.id);
+          if(i>=0){
+            // Cloud wins only if newer
+            if(!existing[i].updatedAt||(item.updatedAt&&item.updatedAt>=existing[i].updatedAt)){
+              existing[i]=item;
+            }
+          } else {
+            existing.push(item);
+          }
         });
         S.s(table,existing);
       }));
@@ -721,8 +732,22 @@ const DB={
     return item;
   },
   del(table,id){
+    // Remove from localStorage
     S.s(table,(S.g(table)||[]).filter(x=>x.id!==id));
-    if(Cloud.available())Cloud.delItem(table,id);
+    // Track deleted IDs so syncFromCloud doesn't restore them
+    const deleted=S.g('_deleted')||{};
+    if(!deleted[table])deleted[table]=[];
+    if(!deleted[table].includes(id))deleted[table].push(id);
+    S.s('_deleted',deleted);
+    // Delete from Firestore — retry if Firebase not ready yet
+    const tryDelete=()=>{
+      if(Cloud.available()){
+        Cloud.delItem(table,id);
+      } else {
+        setTimeout(tryDelete,500);
+      }
+    };
+    tryDelete();
   },
   activeSession(campaignId){return(S.g('sessions')||[]).find(s=>s.campaignId===campaignId&&s.active)||null;},
   sessionByCode(code){return(S.g('sessions')||[]).find(s=>s.code===code.toUpperCase()&&s.active)||null;}
@@ -2788,8 +2813,8 @@ function showReadyCheckGM(){
     <div class="modal-acts" style="margin-top:14px;"><button class="btn pr" onclick="closeModal()">Close</button></div>`);
 }
 function handleReadyCheck(data){
-  // Player receives ready check
-  if(isGM())return;
+  // Only show to players — not the GM who sent it, not campaign owners
+  if(canEdit())return; // campaign owner sent this
   const ov=document.createElement('div');ov.className='ov';ov.id='ready-check-ov';
   ov.innerHTML=`<div class="confirm-box" style="border-color:var(--green);">
     <div style="font-size:28px;margin-bottom:12px;">⚡</div>
@@ -3473,10 +3498,13 @@ const RT={
 
     this.ably.connection.on('connected',()=>{
       addFeed('System','Connected · '+code,'system');
-
+      // Unsubscribe first so we don't stack duplicate listeners on reconnect
+      this.channel.unsubscribe();
       this.channel.subscribe(msg=>{
         try{
           const data=typeof msg.data==='string'?JSON.parse(msg.data):msg.data;
+          // Filter own messages
+          if(data&&data._sender===this.myClientId)return;
           this._handle(msg.name,data);
         }catch(e){console.error('recv err',e);}
       });
@@ -3485,8 +3513,9 @@ const RT={
         this._onlineUsers[this.myClientId]={name:CU?CU.name:'Player',role:CU?CU.role:'player',id:this.myClientId,ts:Date.now()};
         this._updatePresence();
         this.pub('heartbeat',{name:CU?CU.name:'Player',role:CU?CU.role:'player',id:this.myClientId});
-        if(!isGM()){setTimeout(()=>this.pub('request_state',{who:CU?CU.name:'Player'}),500);}
-      },1000);
+        // Always request fresh state on (re)connect — gets latest canvas state
+        if(!isGM())setTimeout(()=>this.pub('request_state',{who:CU?CU.name:'Player'}),500);
+      },500);
     });
 
     this._heartbeatInterval=setInterval(()=>{
@@ -3509,7 +3538,8 @@ const RT={
 
   pub(name,data){
     if(!this.channel)return;
-    this.channel.publish(name,data||{},(err)=>{
+    const payload={...(data||{}),_sender:this.myClientId};
+    this.channel.publish(name,payload,(err)=>{
       if(err)addFeed('System','❌ Ably: '+err.message,'system');
     });
   },
@@ -3605,7 +3635,13 @@ const RT={
 
   sendFullState(){
     const tokens=Canvas.getTokens().map(t=>{const c={...t};delete c.imgEl;return c;});
-    this.pub('full_state',{tokens,drawData:Canvas.exportDraw(),fogData:Canvas.exportFog(),activeMapIdx});
+    // Include the active map image so players can render it
+    let mapData=null;
+    if(CC){
+      const maps=DB.list('maps',CC.id);
+      if(maps[activeMapIdx]&&maps[activeMapIdx].imgData)mapData=maps[activeMapIdx].imgData;
+    }
+    this.pub('full_state',{tokens,drawData:Canvas.exportDraw(),fogData:Canvas.exportFog(),activeMapIdx,mapData});
   },
 
   flushIfDirty(){
@@ -3999,17 +4035,13 @@ const Canvas=(()=>{
   function applyRemoteFog(d){if(!fgX)return;fgX.fillStyle='rgba(0,0,0,0.88)';fgX.beginPath();fgX.arc(d.x,d.y,d.sz*4,0,Math.PI*2);fgX.fill();}
   function applyRemoteUnfog(d){if(!fgX)return;fgX.clearRect(d.x-d.sz*5,d.y-d.sz*5,d.sz*10,d.sz*10);}
   function applyFullState(d){
-    // Load map first (background), then draw layer, then fog, then tokens
     const doFinish=()=>{
-      // Restore tokens
       clearAllTokens();
       (d.tokens||[]).forEach(t=>addTokenDirect(t));
-      // Apply draw layer
       if(d.drawData){
         const img=new Image();
         img.onload=()=>{
           if(drX){drX.clearRect(0,0,drC.width,drC.height);drX.drawImage(img,0,0,drC.width,drC.height);}
-          // Apply fog last so it sits on top
           if(d.fogData){
             const fi=new Image();
             fi.onload=()=>{if(fgX){fgX.clearRect(0,0,fgC.width,fgC.height);fgX.drawImage(fi,0,0,fgC.width,fgC.height);}};
@@ -4027,16 +4059,24 @@ const Canvas=(()=>{
     if(d.activeMapIdx!==undefined){
       activeMapIdx=d.activeMapIdx;
       document.querySelectorAll('.map-tab').forEach((t,i)=>t.classList.toggle('on',i===activeMapIdx));
-      if(typeof CC!=='undefined'&&CC){
-        const maps=DB.list('maps',CC.id);
-        const m=maps[activeMapIdx];
-        if(m&&m.imgData){
-          // Load map image first, then apply all other layers on top
-          const mi=new Image();
-          mi.onload=()=>{mapImg=mi;redrawBg();doFinish();};
-          mi.src=m.imgData;
-          return;
-        }
+    }
+
+    // Use map image from state payload (sent by GM) — works cross-device
+    if(d.mapData){
+      const mi=new Image();
+      mi.onload=()=>{mapImg=mi;redrawBg();doFinish();};
+      mi.src=d.mapData;
+      return;
+    }
+    // Fallback: try local maps library
+    if(typeof CC!=='undefined'&&CC){
+      const maps=DB.list('maps',CC.id);
+      const m=maps[activeMapIdx];
+      if(m&&m.imgData){
+        const mi=new Image();
+        mi.onload=()=>{mapImg=mi;redrawBg();doFinish();};
+        mi.src=m.imgData;
+        return;
       }
     }
     doFinish();
