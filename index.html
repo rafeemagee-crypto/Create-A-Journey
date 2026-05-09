@@ -537,10 +537,25 @@ const FB_CONFIG={
   appId:"1:123551854366:web:9e6d02aa496fb729cb630f"
 };
 let fbApp=null,fbDb=null;
-try{
-  fbApp=firebase.initializeApp(FB_CONFIG);
-  fbDb=firebase.firestore();
-}catch(e){console.warn('Firebase init failed:',e);}
+function initFirebase(){
+  // If Firebase SDK hasn't loaded yet, retry
+  if(typeof firebase==='undefined'){
+    console.warn('Firebase SDK not loaded yet, retrying…');
+    setTimeout(initFirebase,200);
+    return;
+  }
+  try{
+    // Avoid re-initializing if already done
+    if(fbDb)return;
+    fbApp=firebase.apps.length?firebase.apps[0]:firebase.initializeApp(FB_CONFIG);
+    fbDb=firebase.firestore();
+    fbDb.collection('_ping').doc('test').set({ts:Date.now()}).then(()=>{
+      console.log('✅ Firestore connected');
+    }).catch(e=>{
+      console.error('❌ Firestore write failed:',e.code,e.message);
+    });
+  }catch(e){console.error('Firebase init failed:',e);}
+}
 
 // Cloud account functions — accounts live in Firestore, everything else in localStorage
 const Cloud={
@@ -560,7 +575,10 @@ const Cloud={
     if(!fbDb||!user||!user.id)return;
     try{
       await fbDb.collection('accounts').doc(user.id).set(user,{merge:true});
-    }catch(e){console.warn('Cloud saveAccount error:',e);}
+      console.log('✅ Account saved to Firestore:',user.email);
+    }catch(e){
+      console.error('❌ Cloud saveAccount error:',e.code,e.message);
+    }
   },
   // Delete account from Firestore
   async deleteAccount(userId){
@@ -934,7 +952,7 @@ const App={
     let campaigns=DB.campaigns(CU.id);
     // Only pure GM accounts auto-create a campaign — 'both' accounts start empty so they can join first
     if(campaigns.length===0&&CU.role==='gm'){
-      const c=DB.saveCampaign({id:uid(),name:'My First Campaign',ownerId:CU.id,members:[],inviteCode:null});
+      const c=DB.saveCampaign({id:uid(),name:'My First Campaign',ownerId:CU.id,ownerName:CU.name,members:[],inviteCode:null});
       campaigns=[c];
     }
     if(campaigns.length===0){
@@ -1190,7 +1208,7 @@ async function joinCampaignByCode(){
 // ══════════════════════════════════════════
 function renderMembers(){
   const members=CC.members||[];
-  const owner=DB.accounts().find(a=>a.id===CC.ownerId)||{name:'Unknown GM',role:'gm'};
+  const owner=DB.accounts().find(a=>a.id===CC.ownerId)||{name:CC.ownerName||'Game Master',role:'gm'};
   const isOwner=CC.ownerId===CU.id;
   const isMember=!isOwner&&members.some(m=>m.id===CU.id);
   document.getElementById('main').innerHTML=`
@@ -1367,7 +1385,7 @@ function charCard(c){
   const xp=c.xpCurrent||0;const level=xpToLevel(xp);const xpPct=xpProgress(xp,level);const xpNext=xpForNextLevel(level);
   const abilities=(S.g('abilities')||[]).filter(a=>a.charId===c.id);
   // Find assigned player name
-  const allMembers=[...(CC.members||[]),{id:CC.ownerId,name:(DB.accounts().find(a=>a.id===CC.ownerId)||{name:'GM'}).name}];
+  const allMembers=[...(CC.members||[]),{id:CC.ownerId,name:(DB.accounts().find(a=>a.id===CC.ownerId)||{name:CC.ownerName||'Game Master'}).name}];
   const assignedMember=c.playerId?allMembers.find(m=>m.id===c.playerId):null;
   const isMyChar=CU&&c.playerId===CU.id;
   const canEditThis=canEdit()||isMyChar;
@@ -1473,7 +1491,7 @@ function updateTokPreview(){
 
 function charFormHTML(c={}){
   const members=CC?CC.members||[]:[];
-  const owner=CC?{id:CC.ownerId,name:(DB.accounts().find(a=>a.id===CC.ownerId)||{name:'GM'}).name}:null;
+  const owner=CC?{id:CC.ownerId,name:(DB.accounts().find(a=>a.id===CC.ownerId)||{name:CC.ownerName||'Game Master'}).name}:null;
   const allMembers=owner?[owner,...members]:members;
   return`
     <label class="lbl">Name *</label><input class="inp" id="f-name" value="${c.name||''}" placeholder="Character name" oninput="updateTokPreview()">
@@ -4275,7 +4293,12 @@ function copyInviteCode(){const code=CC.inviteCode||'–';navigator.clipboard.wr
 function switchCampaign(id){const c=DB.getCampaign(id);if(c){App.setCampaign(c);toast('Switched to: '+c.name);}}
 
 function openNewCampaignModal(){openModal(`<button class="modal-x" onclick="closeModal()">×</button><div class="modal-t">New campaign</div><label class="lbl">Campaign name *</label><input class="inp" id="f-camp-name" placeholder="e.g. The Shattered Realm"><div class="modal-acts"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn pr" onclick="createCampaign()">Create</button></div>`);}
-function createCampaign(){const name=document.getElementById('f-camp-name').value.trim();if(!name){toast('Enter a campaign name.');return;}const c=DB.saveCampaign({id:uid(),name,ownerId:CU.id,members:[],inviteCode:null});closeModal();App.setCampaign(c);toast('Campaign created: '+name);}
+function createCampaign(){
+  const name=document.getElementById('f-camp-name').value.trim();
+  if(!name){toast('Enter a campaign name.');return;}
+  const c=DB.saveCampaign({id:uid(),name,ownerId:CU.id,ownerName:CU.name,members:[],inviteCode:null});
+  closeModal();App.setCampaign(c);toast('Campaign created: '+name);
+}
 
 function confirmDeleteCampaign(id,name){
   closeModal();
@@ -4456,12 +4479,12 @@ function doDeleteAccount(){
 //  BOOT
 // ══════════════════════════════════════════
 window.addEventListener('DOMContentLoaded',()=>{
+  initFirebase();
   try{
     const saved=S.g('session');
     if(saved)App.launch(saved);
   }catch(e){
     console.error('Boot error:',e);
-    // Clear bad session and show auth
     S.d('session');
     document.getElementById('auth').style.display='flex';
   }
